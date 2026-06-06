@@ -167,6 +167,7 @@ async fn process_chat_cycle(
     url: &str,
     model: &str,
     messages: &mut Vec<ChatMessage>,
+    last_output: &mut String,
     interactive: bool,
 ) -> Result<()> {
     let max_loops = 5;
@@ -201,20 +202,27 @@ async fn process_chat_cycle(
                 });
 
                 if let Some(cmd) = extract_powershell_block(&answer) {
-                    print!("\x1b[1;36mExecute PowerShell command? (y/N): \x1b[0m");
-                    io::stdout().flush().context("Failed to flush stdout")?;
-                    let mut confirm = String::new();
-                    io::stdin().read_line(&mut confirm).context("Failed to read confirmation")?;
+                    let confirm = match read_line_custom("\x1b[1;36mExecute PowerShell command? (y/N): \x1b[0m", last_output) {
+                        Ok(Some(inp)) => inp,
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!("Input error: {:#}", e);
+                            break;
+                        }
+                    };
                     let trimmed_confirm = confirm.trim().to_lowercase();
 
                     if trimmed_confirm == "y" || trimmed_confirm == "yes" {
                         println!("\x1b[33mExecuting command via PowerShell...\x1b[0m");
                         match execute_powershell_command(&cmd) {
                             Ok((success, output)) => {
+                                // Store output for Ctrl+O expansion
+                                *last_output = output.clone();
+
                                 if success {
-                                    println!("\n\x1b[32m--- Command Output ---\n{}\n----------------------\x1b[0m\n", output);
+                                    println!("\n\x1b[32m[✔ PowerShell command executed successfully. Press Ctrl+O to expand output]\x1b[0m\n");
                                 } else {
-                                    println!("\n\x1b[31m--- Command Failed ---\n{}\n----------------------\x1b[0m\n", output);
+                                    println!("\n\x1b[31m[✘ PowerShell command failed. Press Ctrl+O to expand output]\x1b[0m\n");
                                 }
 
                                 messages.push(ChatMessage {
@@ -255,6 +263,179 @@ async fn process_chat_cycle(
         }
     }
     Ok(())
+}
+
+fn read_line_custom(prompt: &str, last_output: &str) -> Result<Option<String>> {
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyModifiers},
+        execute,
+        terminal::{self, ClearType},
+    };
+
+    // Print the initial prompt
+    print!("{}", prompt);
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    let mut buffer = String::new();
+    let mut cursor_pos = 0; // index in character count
+
+    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+    let _guard = RawModeGuard;
+
+    loop {
+        if event::poll(std::time::Duration::from_millis(100)).context("Failed to poll terminal event")? {
+            if let Event::Key(key_event) = event::read().context("Failed to read terminal event")? {
+                if key_event.kind == event::KeyEventKind::Release {
+                    continue; // Skip key release events on Windows
+                }
+
+                // Check for Ctrl + O (Expand output)
+                if key_event.code == KeyCode::Char('o') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
+                    
+                    println!(); // Print newline to move off the prompt line
+                    
+                    if last_output.is_empty() {
+                        println!("\x1b[38;5;244m[No command output available yet]\x1b[0m");
+                    } else {
+                        // Print output with light gray background and dark text
+                        println!("\x1b[1;30;48;5;252m--- Expanded Command Output ---\x1b[0m");
+                        for line in last_output.lines() {
+                            println!("\x1b[38;5;235;48;5;252m{}\x1b[0m", line);
+                        }
+                        println!("\x1b[1;30;48;5;252m--------------------------------\x1b[0m");
+                    }
+                    
+                    terminal::enable_raw_mode().context("Failed to re-enable raw mode")?;
+                    
+                    // Reprint prompt and buffer
+                    print!("\r");
+                    execute!(io::stdout(), terminal::Clear(ClearType::CurrentLine)).context("Failed to clear line")?;
+                    print!("{}{}", prompt, buffer);
+                    
+                    // Reposition cursor
+                    let offset = buffer.chars().count() - cursor_pos;
+                    if offset > 0 {
+                        execute!(io::stdout(), cursor::MoveLeft(offset as u16)).context("Failed to move cursor")?;
+                    }
+                    io::stdout().flush().context("Failed to flush stdout")?;
+                    continue;
+                }
+
+                // Check for Ctrl + C / Ctrl + D (Exit)
+                if (key_event.code == KeyCode::Char('c') && key_event.modifiers.contains(KeyModifiers::CONTROL))
+                    || key_event.code == KeyCode::Char('d') && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
+                    println!("\nGoodbye!");
+                    std::process::exit(0);
+                }
+
+                match key_event.code {
+                    KeyCode::Enter => {
+                        terminal::disable_raw_mode().context("Failed to disable raw mode")?;
+                        println!();
+                        break;
+                    }
+                    KeyCode::Backspace => {
+                        if cursor_pos > 0 {
+                            // Find the char index to remove
+                            let char_idx = buffer.char_indices().nth(cursor_pos - 1).map(|(i, _)| i).unwrap_or(0);
+                            buffer.remove(char_idx);
+                            cursor_pos -= 1;
+                            
+                            print!("\r");
+                            execute!(io::stdout(), terminal::Clear(ClearType::CurrentLine)).context("Failed to clear line")?;
+                            print!("{}{}", prompt, buffer);
+                            
+                            let offset = buffer.chars().count() - cursor_pos;
+                            if offset > 0 {
+                                execute!(io::stdout(), cursor::MoveLeft(offset as u16)).context("Failed to move cursor")?;
+                            }
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if cursor_pos < buffer.chars().count() {
+                            let char_idx = buffer.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(0);
+                            buffer.remove(char_idx);
+                            
+                            print!("\r");
+                            execute!(io::stdout(), terminal::Clear(ClearType::CurrentLine)).context("Failed to clear line")?;
+                            print!("{}{}", prompt, buffer);
+                            
+                            let offset = buffer.chars().count() - cursor_pos;
+                            if offset > 0 {
+                                execute!(io::stdout(), cursor::MoveLeft(offset as u16)).context("Failed to move cursor")?;
+                            }
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::Left => {
+                        if cursor_pos > 0 {
+                            cursor_pos -= 1;
+                            execute!(io::stdout(), cursor::MoveLeft(1)).context("Failed to move cursor left")?;
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if cursor_pos < buffer.chars().count() {
+                            cursor_pos += 1;
+                            execute!(io::stdout(), cursor::MoveRight(1)).context("Failed to move cursor right")?;
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::Home => {
+                        if cursor_pos > 0 {
+                            execute!(io::stdout(), cursor::MoveLeft(cursor_pos as u16)).context("Failed to move cursor to start")?;
+                            cursor_pos = 0;
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::End => {
+                        let total_chars = buffer.chars().count();
+                        if cursor_pos < total_chars {
+                            let diff = total_chars - cursor_pos;
+                            execute!(io::stdout(), cursor::MoveRight(diff as u16)).context("Failed to move cursor to end")?;
+                            cursor_pos = total_chars;
+                            io::stdout().flush().context("Failed to flush stdout")?;
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        // Insert char at cursor_pos character index
+                        let byte_idx = if cursor_pos == 0 {
+                            0
+                        } else {
+                            buffer.char_indices().nth(cursor_pos).map(|(i, _)| i).unwrap_or(buffer.len())
+                        };
+                        buffer.insert(byte_idx, c);
+                        cursor_pos += 1;
+                        
+                        print!("\r");
+                        execute!(io::stdout(), terminal::Clear(ClearType::CurrentLine)).context("Failed to clear line")?;
+                        print!("{}{}", prompt, buffer);
+                        
+                        let offset = buffer.chars().count() - cursor_pos;
+                        if offset > 0 {
+                            execute!(io::stdout(), cursor::MoveLeft(offset as u16)).context("Failed to move cursor")?;
+                        }
+                        io::stdout().flush().context("Failed to flush stdout")?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(Some(buffer))
 }
 
 #[tokio::main]
@@ -312,6 +493,8 @@ async fn main() -> Result<()> {
                          The user will be prompted to approve the command before execution. \
                          Provide only one code block per turn. Keep explanations brief and precise.";
 
+    let mut last_output = String::new();
+
     if !user_prompt_args.trim().is_empty() {
         // Execute single query if CLI arguments are provided
         let mut messages = vec![
@@ -325,7 +508,7 @@ async fn main() -> Result<()> {
             },
         ];
 
-        if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, false).await {
+        if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, &mut last_output, false).await {
             eprintln!("\nExecution Error: {:#}\n", e);
         }
     } else {
@@ -387,11 +570,16 @@ async fn main() -> Result<()> {
         println!("Type 'exit' or 'quit' to end the chat session.\n");
 
         loop {
-            print!("> \x1b[93m");
-            io::stdout().flush().context("Failed to flush stdout")?;
+            let prompt = "> \x1b[93m";
+            let input = match read_line_custom(prompt, &last_output) {
+                Ok(Some(inp)) => inp,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("Input error: {:#}", e);
+                    break;
+                }
+            };
 
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).context("Failed to read from stdin")?;
             print!("\x1b[0m");
             io::stdout().flush().context("Failed to flush stdout")?;
             let trimmed = input.trim();
@@ -410,7 +598,7 @@ async fn main() -> Result<()> {
                 content: trimmed.to_string(),
             });
 
-            if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, true).await {
+            if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, &mut last_output, true).await {
                 eprintln!("\nError: {:#}\n", e);
                 // Remove the user message on error so we don't corrupt history
                 messages.pop();
