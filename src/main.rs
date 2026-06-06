@@ -162,18 +162,96 @@ fn execute_powershell_command(command: &str) -> Result<(bool, String)> {
     Ok((output.status.success(), combined))
 }
 
+fn load_memo() -> Option<String> {
+    std::fs::read_to_string(".shokodex_memo").ok()
+}
+
+async fn listen_for_esc() -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode};
+    use std::time::Duration;
+
+    loop {
+        if event::poll(Duration::from_millis(50)).context("Failed to poll terminal event")? {
+            if let Event::Key(key_event) = event::read().context("Failed to read terminal event")? {
+                if key_event.kind == event::KeyEventKind::Press && key_event.code == KeyCode::Esc {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn get_chat_response_interruptible(
+    client: &Client,
+    url: &str,
+    request: &ChatCompletionRequest,
+    interactive: bool,
+) -> Result<Option<String>> {
+    use crossterm::terminal;
+
+    if interactive {
+        terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+        print!("Thinking... (Press Esc to cancel)");
+        io::stdout().flush().context("Failed to flush stdout")?;
+    }
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+    let _guard = RawModeGuard;
+
+    let api_future = get_chat_response(client, url, request);
+    let esc_future = listen_for_esc();
+
+    tokio::select! {
+        res = api_future => {
+            if interactive {
+                let _ = terminal::disable_raw_mode();
+                print!("\r");
+                let _ = crossterm::execute!(io::stdout(), terminal::Clear(terminal::ClearType::CurrentLine));
+                io::stdout().flush().context("Failed to flush stdout")?;
+            }
+            res.map(Some)
+        }
+        _ = esc_future => {
+            if interactive {
+                let _ = terminal::disable_raw_mode();
+                println!("\n\x1b[31m[Thinking interrupted by user via Esc]\x1b[0m");
+            }
+            Ok(None)
+        }
+    }
+}
+
 async fn process_chat_cycle(
     client: &Client,
     url: &str,
     model: &str,
+    system_prompt: &str,
     messages: &mut Vec<ChatMessage>,
     last_output: &mut String,
     interactive: bool,
 ) -> Result<()> {
-    let max_loops = 5;
-    let mut loop_count = 0;
-
     loop {
+        // Load the latest memo and inject it dynamically into the system message context
+        let current_memo = load_memo();
+        let mut full_system_prompt = system_prompt.to_string();
+        if let Some(memo) = current_memo {
+            full_system_prompt.push_str("\n\n[MEMO / PROGRESS NOTES - read this to remember your current state]\n");
+            full_system_prompt.push_str(&memo);
+            full_system_prompt.push_str("\n[END OF MEMO]");
+        }
+
+        if let Some(first_msg) = messages.first_mut() {
+            if first_msg.role == "system" {
+                first_msg.content = full_system_prompt;
+            }
+        }
+
         let request_body = ChatCompletionRequest {
             model: model.to_string(),
             messages: messages.clone(),
@@ -182,85 +260,70 @@ async fn process_chat_cycle(
             stream: false,
         };
 
-        if interactive {
-            print!("Thinking...");
-            io::stdout().flush().context("Failed to flush stdout")?;
-        }
+        let response_opt = get_chat_response_interruptible(client, url, &request_body, interactive).await?;
 
-        match get_chat_response(client, url, &request_body).await {
-            Ok(answer) => {
-                if interactive {
-                    // Erase "Thinking..."
-                    print!("\r            \r");
-                    io::stdout().flush().context("Failed to flush stdout")?;
+        let answer = match response_opt {
+            Some(ans) => ans,
+            None => {
+                // Cancelled by Esc
+                break;
+            }
+        };
+
+        println!("\n• {answer}\n");
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: answer.clone(),
+        });
+
+        if let Some(cmd) = extract_powershell_block(&answer) {
+            let confirm = match read_line_custom("\x1b[1;36mExecute PowerShell command? (y/N): \x1b[0m", last_output) {
+                Ok(Some(inp)) => inp,
+                Ok(None) => {
+                    println!("Execution sequence interrupted by user.");
+                    break;
                 }
+                Err(e) => {
+                    eprintln!("Input error: {:#}", e);
+                    break;
+                }
+            };
+            let trimmed_confirm = confirm.trim().to_lowercase();
 
-                println!("\n• {answer}\n");
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: answer.clone(),
-                });
+            if trimmed_confirm == "y" || trimmed_confirm == "yes" {
+                println!("\x1b[33mExecuting command via PowerShell...\x1b[0m");
+                match execute_powershell_command(&cmd) {
+                    Ok((success, output)) => {
+                        // Store output for Ctrl+O expansion
+                        *last_output = output.clone();
 
-                if let Some(cmd) = extract_powershell_block(&answer) {
-                    let confirm = match read_line_custom("\x1b[1;36mExecute PowerShell command? (y/N): \x1b[0m", last_output) {
-                        Ok(Some(inp)) => inp,
-                        Ok(None) => break,
-                        Err(e) => {
-                            eprintln!("Input error: {:#}", e);
-                            break;
-                        }
-                    };
-                    let trimmed_confirm = confirm.trim().to_lowercase();
-
-                    if trimmed_confirm == "y" || trimmed_confirm == "yes" {
-                        println!("\x1b[33mExecuting command via PowerShell...\x1b[0m");
-                        match execute_powershell_command(&cmd) {
-                            Ok((success, output)) => {
-                                // Store output for Ctrl+O expansion
-                                *last_output = output.clone();
-
-                                if success {
-                                    println!("\n\x1b[32m[✔ PowerShell command executed successfully. Press Ctrl+O to expand output]\x1b[0m\n");
-                                } else {
-                                    println!("\n\x1b[31m[✘ PowerShell command failed. Press Ctrl+O to expand output]\x1b[0m\n");
-                                }
-
-                                messages.push(ChatMessage {
-                                    role: "user".to_string(),
-                                    content: format!("Command output:\n{}", output),
-                                });
-                            }
-                            Err(e) => {
-                                println!("\x1b[31mExecution error: {:#}\x1b[0m", e);
-                                messages.push(ChatMessage {
-                                    role: "user".to_string(),
-                                    content: format!("Command execution failed with internal error: {:#}", e),
-                                });
-                            }
+                        if success {
+                            println!("\n\x1b[32m[✔ PowerShell command executed successfully. Press Ctrl+O to expand output]\x1b[0m\n");
+                        } else {
+                            println!("\n\x1b[31m[✘ PowerShell command failed. Press Ctrl+O to expand output]\x1b[0m\n");
                         }
 
-                        loop_count += 1;
-                        if loop_count >= max_loops {
-                            println!("Max execution loops reached ({}). Stopping.", max_loops);
-                            break;
-                        }
-                        // Continue loop to get the next LLM response with tool output
-                        continue;
-                    } else {
-                        println!("Execution cancelled by user.");
-                        break;
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("Command output:\n{}", output),
+                        });
+                    }
+                    Err(e) => {
+                        println!("\x1b[31mExecution error: {:#}\x1b[0m", e);
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("Command execution failed with internal error: {:#}", e),
+                        });
                     }
                 }
-                break; // No command block found, cycle complete.
-            }
-            Err(e) => {
-                if interactive {
-                    print!("\r            \r");
-                    io::stdout().flush().context("Failed to flush stdout")?;
-                }
-                return Err(e);
+                // Continue loop to get the next LLM response with tool output (infinite loop allowed)
+                continue;
+            } else {
+                println!("Execution cancelled by user.");
+                break;
             }
         }
+        break; // No command block found, cycle complete.
     }
     Ok(())
 }
@@ -295,6 +358,13 @@ fn read_line_custom(prompt: &str, last_output: &str) -> Result<Option<String>> {
             if let Event::Key(key_event) = event::read().context("Failed to read terminal event")? {
                 if key_event.kind == event::KeyEventKind::Release {
                     continue; // Skip key release events on Windows
+                }
+
+                // Check for Esc
+                if key_event.code == KeyCode::Esc {
+                    terminal::disable_raw_mode().context("Failed to disable raw mode")?;
+                    println!();
+                    return Ok(None);
                 }
 
                 // Check for Ctrl + O (Expand output)
@@ -491,7 +561,10 @@ async fn main() -> Result<()> {
                          <commands>\n\
                          ```\n\
                          The user will be prompted to approve the command before execution. \
-                         Provide only one code block per turn. Keep explanations brief and precise.";
+                         Provide only one code block per turn. Keep explanations brief and precise.\n\
+                         You have a persistent notes file '.shokodex_memo' in the current directory. \
+                         You can read/write to it using PowerShell (Get-Content / Set-Content) to record memos of what you do \
+                         so you do not lose track of your progress across multiple turns.";
 
     let mut last_output = String::new();
 
@@ -508,7 +581,7 @@ async fn main() -> Result<()> {
             },
         ];
 
-        if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, &mut last_output, false).await {
+        if let Err(e) = process_chat_cycle(&client, &url, &model, system_prompt, &mut messages, &mut last_output, false).await {
             eprintln!("\nExecution Error: {:#}\n", e);
         }
     } else {
@@ -573,7 +646,10 @@ async fn main() -> Result<()> {
             let prompt = "> \x1b[93m";
             let input = match read_line_custom(prompt, &last_output) {
                 Ok(Some(inp)) => inp,
-                Ok(None) => break,
+                Ok(None) => {
+                    println!("(Use 'exit' or 'quit' to exit)");
+                    continue;
+                }
                 Err(e) => {
                     eprintln!("Input error: {:#}", e);
                     break;
@@ -598,7 +674,7 @@ async fn main() -> Result<()> {
                 content: trimmed.to_string(),
             });
 
-            if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, &mut last_output, true).await {
+            if let Err(e) = process_chat_cycle(&client, &url, &model, system_prompt, &mut messages, &mut last_output, true).await {
                 eprintln!("\nError: {:#}\n", e);
                 // Remove the user message on error so we don't corrupt history
                 messages.pop();
