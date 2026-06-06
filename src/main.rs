@@ -123,6 +123,140 @@ async fn get_chat_response(client: &Client, url: &str, request: &ChatCompletionR
     Ok(answer)
 }
 
+fn extract_powershell_block(content: &str) -> Option<String> {
+    let start_tag = "```powershell";
+    let end_tag = "```";
+    if let Some(start_idx) = content.find(start_tag) {
+        let code_start = start_idx + start_tag.len();
+        if let Some(end_idx) = content[code_start..].find(end_tag) {
+            let command = content[code_start..(code_start + end_idx)].trim().to_string();
+            return Some(command);
+        }
+    }
+    None
+}
+
+fn execute_powershell_command(command: &str) -> Result<(bool, String)> {
+    let output = std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(command)
+        .output()
+        .context("Failed to execute PowerShell process")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let mut combined = String::new();
+    if !stdout.is_empty() {
+        combined.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push_str("\n");
+        }
+        combined.push_str("Errors/Stderr:\n");
+        combined.push_str(&stderr);
+    }
+
+    Ok((output.status.success(), combined))
+}
+
+async fn process_chat_cycle(
+    client: &Client,
+    url: &str,
+    model: &str,
+    messages: &mut Vec<ChatMessage>,
+    interactive: bool,
+) -> Result<()> {
+    let max_loops = 5;
+    let mut loop_count = 0;
+
+    loop {
+        let request_body = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            temperature: 0.2,
+            max_tokens: 2048,
+            stream: false,
+        };
+
+        if interactive {
+            print!("Thinking...");
+            io::stdout().flush().context("Failed to flush stdout")?;
+        }
+
+        match get_chat_response(client, url, &request_body).await {
+            Ok(answer) => {
+                if interactive {
+                    // Erase "Thinking..."
+                    print!("\r            \r");
+                    io::stdout().flush().context("Failed to flush stdout")?;
+                }
+
+                println!("\n• {answer}\n");
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: answer.clone(),
+                });
+
+                if let Some(cmd) = extract_powershell_block(&answer) {
+                    print!("\x1b[1;36mExecute PowerShell command? (y/N): \x1b[0m");
+                    io::stdout().flush().context("Failed to flush stdout")?;
+                    let mut confirm = String::new();
+                    io::stdin().read_line(&mut confirm).context("Failed to read confirmation")?;
+                    let trimmed_confirm = confirm.trim().to_lowercase();
+
+                    if trimmed_confirm == "y" || trimmed_confirm == "yes" {
+                        println!("\x1b[33mExecuting command via PowerShell...\x1b[0m");
+                        match execute_powershell_command(&cmd) {
+                            Ok((success, output)) => {
+                                if success {
+                                    println!("\n\x1b[32m--- Command Output ---\n{}\n----------------------\x1b[0m\n", output);
+                                } else {
+                                    println!("\n\x1b[31m--- Command Failed ---\n{}\n----------------------\x1b[0m\n", output);
+                                }
+
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!("Command output:\n{}", output),
+                                });
+                            }
+                            Err(e) => {
+                                println!("\x1b[31mExecution error: {:#}\x1b[0m", e);
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!("Command execution failed with internal error: {:#}", e),
+                                });
+                            }
+                        }
+
+                        loop_count += 1;
+                        if loop_count >= max_loops {
+                            println!("Max execution loops reached ({}). Stopping.", max_loops);
+                            break;
+                        }
+                        // Continue loop to get the next LLM response with tool output
+                        continue;
+                    } else {
+                        println!("Execution cancelled by user.");
+                        break;
+                    }
+                }
+                break; // No command block found, cycle complete.
+            }
+            Err(e) => {
+                if interactive {
+                    print!("\r            \r");
+                    io::stdout().flush().context("Failed to flush stdout")?;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let base_url = env::var("LMSTUDIO_BASE_URL")
@@ -169,35 +303,37 @@ async fn main() -> Result<()> {
         .collect::<Vec<String>>()
         .join(" ");
 
+    let system_prompt = "You are Shokodex, a helpful assistant with access to the local machine via PowerShell. \
+                         If you need to query the system, run commands, list files, or perform operations to answer the user, \
+                         provide the command in a code block formatted as:\n\
+                         ```powershell\n\
+                         <commands>\n\
+                         ```\n\
+                         The user will be prompted to approve the command before execution. \
+                         Provide only one code block per turn. Keep explanations brief and precise.";
+
     if !user_prompt_args.trim().is_empty() {
         // Execute single query if CLI arguments are provided
-        let request_body = ChatCompletionRequest {
-            model,
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: "You are a helpful, concise, and precise assistant.".to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt_args,
-                },
-            ],
-            temperature: 0.2,
-            max_tokens: 512,
-            stream: false,
-        };
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_prompt_args,
+            },
+        ];
 
-        match get_chat_response(&client, &url, &request_body).await {
-            Ok(answer) => println!("\n• {answer}\n"),
-            Err(e) => eprintln!("\nError: {:#}\n", e),
+        if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, false).await {
+            eprintln!("\nExecution Error: {:#}\n", e);
         }
     } else {
         // Start interactive REPL loop with conversation history
         let mut messages = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are a helpful, concise, and precise assistant.".to_string(),
+                content: system_prompt.to_string(),
             },
         ];
 
@@ -213,7 +349,7 @@ async fn main() -> Result<()> {
                     style: "\x1b[37m", // white
                 },
                 Span {
-                    content: "(v0.0.1)".to_string(),
+                    content: "(v0.0.1 - PowerShell enabled)".to_string(),
                     style: "\x1b[38;5;244m", // gray
                 },
             ],
@@ -274,35 +410,10 @@ async fn main() -> Result<()> {
                 content: trimmed.to_string(),
             });
 
-            let request_body = ChatCompletionRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                temperature: 0.2,
-                max_tokens: 512,
-                stream: false,
-            };
-
-            print!("Thinking...");
-            io::stdout().flush().context("Failed to flush stdout")?;
-
-            match get_chat_response(&client, &url, &request_body).await {
-                Ok(answer) => {
-                    // Erase "Thinking..." from line
-                    print!("\r            \r");
-                    io::stdout().flush().context("Failed to flush stdout")?;
-                    println!("\n• {answer}\n");
-                    messages.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: answer,
-                    });
-                }
-                Err(e) => {
-                    print!("\r            \r");
-                    io::stdout().flush().context("Failed to flush stdout")?;
-                    eprintln!("\nError: {:#}\n", e);
-                    // Pop the user message since it didn't succeed to avoid corrupting history
-                    messages.pop();
-                }
+            if let Err(e) = process_chat_cycle(&client, &url, &model, &mut messages, true).await {
+                eprintln!("\nError: {:#}\n", e);
+                // Remove the user message on error so we don't corrupt history
+                messages.pop();
             }
         }
     }
